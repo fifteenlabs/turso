@@ -11,6 +11,7 @@ use super::stream::{
     ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
 };
 use super::MaintenanceInput;
+use crate::ast;
 use crate::function::AggFunc;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
@@ -31,7 +32,6 @@ use crate::vdbe::insn::{
     IvmSumKind, RegisterOrLiteral,
 };
 use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_group_aggregate(
@@ -180,7 +180,7 @@ fn emit_group_aggregate_rows(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::EngineDialect),
+        connection.dialect().get_internal_dialect(),
         None,
         RoleId::SUPERUSER,
     );

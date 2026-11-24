@@ -10,6 +10,7 @@ pub fn to_u32(v: usize) -> u32 {
 }
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::ast::{ResolveType, SortOrder};
 use crate::function::AccumulatorFunc;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
@@ -24,7 +25,6 @@ use crate::{
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_parser::ast::{ResolveType, SortOrder};
 
 /// The program run by an `Insn::Program` instruction.
 ///
@@ -296,7 +296,7 @@ pub struct AlterColumnData {
     pub namespace: NamespaceId,
     pub table: String,
     pub column_index: usize,
-    pub definition: turso_parser::ast::ColumnDefinition,
+    pub definition: crate::ast::ColumnDefinition,
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
     pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
@@ -331,11 +331,8 @@ pub struct SorterOpenData {
     pub cursor_id: CursorID, // P1
     pub columns: usize,      // P2
     /// Combined order, collation, and nulls ordering per column.
-    pub order_collations_nulls: crate::alloc::Vec<(
-        SortOrder,
-        CollationSeq,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    pub order_collations_nulls:
+        crate::alloc::Vec<(SortOrder, CollationSeq, Option<crate::ast::NullsOrder>)>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -348,6 +345,11 @@ pub struct AggStepData {
     /// The collation MIN, MAX, mode and percentile compare the argument with.
     /// BINARY for the aggregates that do not compare values.
     pub collation: CollationSeq,
+    /// For MIN and MAX: a register that the step sets to 1 when the row keeps
+    /// the minimum or maximum of an earlier row, and to 0 otherwise. Bare
+    /// columns of the query take their values from the rows where it is 0,
+    /// as SQLite's OP_CollSeq register does. None for the other aggregates.
+    pub minmax_keeps_best_reg: Option<usize>,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
@@ -1015,6 +1017,18 @@ pub enum Insn {
         description: String,
     },
 
+    /// Replaces the value in `reg` with what `function` gives for it and for
+    /// the `param_count` values that start at `params_reg`. NULL is left as it
+    /// is. `function` is the ENCODE, COERCE or DECODE of a type that is written
+    /// in Rust, and `description` names the type and the conversion.
+    TypeConversion {
+        function: crate::types::ConversionFn,
+        reg: usize,
+        params_reg: usize,
+        param_count: usize,
+        description: String,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -1182,6 +1196,12 @@ pub enum Insn {
         err_code: usize,     // p1
         /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>, // p2
+    },
+
+    /// Fail the statement because a row it writes fails a condition of a
+    /// row-level security policy.
+    RowSecurityViolation {
+        denial: Box<crate::security::permission::PermissionDenied>,
     },
 
     /// Start a transaction.
@@ -1934,21 +1954,14 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
-    /// Add a role to the in-memory role catalog after its row was inserted
-    AddRole {
+    /// Make the change `apply` to the dialect's state in the in-memory
+    /// schema of database `db`, after the statement wrote the same change to
+    /// the dialect's own tables. `value_regs` name the registers whose
+    /// values `apply` gets, such as the id a created relation was stored
+    /// under.
+    CatalogApply {
         db: usize,
-        /// Register holding the rowid of the role in the roles table
-        id_reg: usize,
-        name: String,
-        superuser: bool,
-    },
-    /// Tell the dialect that a relation of database `db` changed, after the
-    /// statement wrote the dialect's own schema state for it, so the
-    /// in-memory copy follows. `value_regs` name the registers the dialect
-    /// reads back, such as the id its state gave a created relation.
-    RelationChange {
-        db: usize,
-        change: Box<crate::dialect::RelationChange>,
+        apply: Arc<dyn crate::dialect::CatalogApply>,
         value_regs: Vec<usize>,
     },
 
@@ -2496,6 +2509,7 @@ impl InsnVariants {
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ConvertToType => execute::op_convert_to_type,
+            InsnVariants::TypeConversion => execute::op_type_conversion,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,
@@ -2517,6 +2531,7 @@ impl InsnVariants {
             InsnVariants::Prev => execute::op_prev,
             InsnVariants::Halt => execute::op_halt,
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
+            InsnVariants::RowSecurityViolation => execute::op_row_security_violation,
             InsnVariants::Transaction => execute::op_transaction,
             InsnVariants::AutoCommit => execute::op_auto_commit,
             InsnVariants::Savepoint => execute::op_savepoint,
@@ -2604,8 +2619,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
-            InsnVariants::AddRole => execute::op_add_role,
-            InsnVariants::RelationChange => execute::op_relation_change,
+            InsnVariants::CatalogApply => execute::op_catalog_apply,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2676,7 +2690,7 @@ impl InsnVariants {
 
 impl Insn {
     /// The collations this instruction compares values with.
-    #[cfg(test)]
+    #[cfg(feature = "test_helper")]
     pub(crate) fn collations(&self) -> Vec<CollationSeq> {
         match self {
             Insn::Eq { collation, .. }
@@ -2752,8 +2766,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
-            | Self::AddRole { .. }
-            | Self::RelationChange { .. }
+            | Self::CatalogApply { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

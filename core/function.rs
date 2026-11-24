@@ -124,6 +124,16 @@ pub enum ExtFunc {
         arity: crate::native_ext::FunctionArity,
         deterministic: bool,
         return_type: Option<crate::native_ext::ReturnType>,
+        /// Whether a call also gets the type name of each argument, such as
+        /// `boolean[]`, as one more text argument per argument, after them.
+        receives_argument_types: bool,
+        /// Called at compile time with the type name of each argument, with
+        /// domain names kept, where `receives_argument_types` passes the
+        /// domain's base type; an error refuses the statement.
+        check_argument_types: Option<ArgumentTypeCheck>,
+        /// Whether the result has the type of the first argument, instead of
+        /// `return_type`.
+        returns_first_argument_type: bool,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -131,6 +141,10 @@ pub enum ExtFunc {
         function: Arc<dyn crate::native_ext::AggregateFactory>,
     },
 }
+
+/// A function called at compile time with the type name of each argument,
+/// with domain names kept; an error refuses the statement.
+pub type ArgumentTypeCheck = fn(&[String]) -> crate::Result<()>;
 
 #[derive(Debug)]
 pub struct ExternalContext {
@@ -156,6 +170,7 @@ impl Drop for ExternalContext {
 }
 
 impl ExtFunc {
+    #[allow(clippy::result_unit_err)]
     pub fn agg_args(&self) -> Result<i32, ()> {
         if let ExtFunc::Aggregate { argc, .. } | ExtFunc::NativeAggregate { argc, .. } = self {
             return Ok(*argc);
@@ -178,6 +193,40 @@ impl ExtFunc {
             Self::Scalar { argc, .. }
             | Self::Aggregate { argc, .. }
             | Self::NativeAggregate { argc, .. } => vec![*argc],
+        }
+    }
+
+    pub fn receives_argument_types(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeScalar {
+                receives_argument_types: true,
+                ..
+            }
+        )
+    }
+
+    pub fn check_argument_types(&self) -> Option<ArgumentTypeCheck> {
+        match self {
+            Self::NativeScalar {
+                check_argument_types,
+                ..
+            } => *check_argument_types,
+            _ => None,
+        }
+    }
+
+    /// How the type of the function's result follows from its arguments.
+    pub fn result_type(&self) -> ResultType {
+        match self {
+            Self::NativeScalar {
+                returns_first_argument_type: true,
+                ..
+            } => ResultType::FirstArgument,
+            _ => match self.return_type() {
+                Some(return_type) => ResultType::Declared(return_type),
+                None => ResultType::Unknown,
+            },
         }
     }
 
@@ -680,8 +729,8 @@ impl WindowFunc {
     ///
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
+        use crate::ast::{Expr, FrameBound, FrameMode, Literal};
         use crate::translate::plan::Frame;
-        use turso_parser::ast::{Expr, FrameBound, FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -1034,6 +1083,7 @@ pub enum ScalarFunc {
     BooleanToInt,
     IntToBoolean,
     ValidateIpAddr,
+    TemporalEncode,
     // Numeric type functions
     NumericEncode,
     NumericFit,
@@ -1163,6 +1213,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::TemporalEncode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
@@ -1293,6 +1344,7 @@ impl ScalarFunc {
             | Self::Repeat
             | Self::Lpad
             | Self::Rpad
+            | Self::TemporalEncode
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1324,6 +1376,136 @@ impl ScalarFunc {
             | Self::ArrayRemove
             | Self::ArraySlice
             | Self::StringToArray => ResultType::Declared(ReturnType::Array),
+        }
+    }
+
+    /// Whether the function compares the elements of its array arguments
+    /// with each other or with its other arguments, as `array_position(a, x)`
+    /// does, or makes its arguments and their elements the elements of one
+    /// array, as `ARRAY[x, y]` and `array_append(a, x)` do. Then those values
+    /// must compare. A function that turns its arguments into text, such as
+    /// `concat`, compares nothing.
+    pub fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::Array
+            | Self::ArraySetElement
+            | Self::ArrayAppend
+            | Self::ArrayPrepend
+            | Self::ArrayCat
+            | Self::ArrayRemove
+            | Self::ArrayContains
+            | Self::ArrayPosition
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll => true,
+            Self::Cast
+            | Self::Changes
+            | Self::Char
+            | Self::Coalesce
+            | Self::Concat
+            | Self::ConcatWs
+            | Self::Glob
+            | Self::IfNull
+            | Self::Iif
+            | Self::Instr
+            | Self::Like
+            | Self::Abs
+            | Self::Upper
+            | Self::Lower
+            | Self::Random
+            | Self::RandomBlob
+            | Self::Trim
+            | Self::LTrim
+            | Self::RTrim
+            | Self::Round
+            | Self::Length
+            | Self::OctetLength
+            | Self::Min
+            | Self::Max
+            | Self::Nullif
+            | Self::Sign
+            | Self::Substr
+            | Self::Substring
+            | Self::Soundex
+            | Self::Date
+            | Self::Time
+            | Self::TotalChanges
+            | Self::DateTime
+            | Self::Subtype
+            | Self::Typeof
+            | Self::Unicode
+            | Self::Unistr
+            | Self::UnistrQuote
+            | Self::Quote
+            | Self::SqliteVersion
+            | Self::TursoVersion
+            | Self::SqliteSourceId
+            | Self::UnixEpoch
+            | Self::JulianDay
+            | Self::Hex
+            | Self::Unhex
+            | Self::GetByte
+            | Self::SetByte
+            | Self::ZeroBlob
+            | Self::LastInsertRowid
+            | Self::Replace
+            | Self::StrfTime
+            | Self::Printf
+            | Self::Likely
+            | Self::TimeDiff
+            | Self::Likelihood
+            | Self::TableColumnsJsonArray
+            | Self::BinRecordJsonObject
+            | Self::Attach
+            | Self::Detach
+            | Self::Unlikely
+            | Self::StatInit
+            | Self::StatPush
+            | Self::StatGet
+            | Self::ConnTxnId
+            | Self::IsAutocommit
+            | Self::SequenceWatermark
+            | Self::TestUintEncode
+            | Self::TestUintDecode
+            | Self::StringReverse
+            | Self::Gcd
+            | Self::Lcm
+            | Self::Repeat
+            | Self::Lpad
+            | Self::Rpad
+            | Self::BooleanToInt
+            | Self::IntToBoolean
+            | Self::ValidateIpAddr
+            | Self::TemporalEncode
+            | Self::NumericEncode
+            | Self::NumericFit
+            | Self::NumericDecode
+            | Self::NumericAdd
+            | Self::NumericSub
+            | Self::NumericMul
+            | Self::NumericDiv
+            | Self::NumericMod
+            | Self::NumericNeg
+            | Self::DatePlus
+            | Self::DateMinus
+            | Self::DateDiff
+            | Self::ArrayElement
+            | Self::ArrayLength
+            | Self::ArraySlice
+            | Self::StringToArray
+            | Self::ArrayToString
+            | Self::StructPack
+            | Self::StructExtractFunc
+            | Self::UnionValueFunc
+            | Self::UnionTagFunc
+            | Self::UnionExtractFunc
+            | Self::NextVal
+            | Self::CurrVal
+            | Self::SetVal => false,
+            #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
+            Self::LoadExtension => false,
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => false,
         }
     }
 
@@ -1427,6 +1609,7 @@ impl Display for ScalarFunc {
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
+            Self::TemporalEncode => "temporal_encode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
@@ -1578,7 +1761,8 @@ impl ScalarFunc {
             | Self::NumericEncode
             | Self::NumericDecode
             | Self::NumericNeg => &[1],
-            Self::NumericAdd
+            Self::TemporalEncode
+            | Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
@@ -1897,6 +2081,10 @@ pub enum ResultType {
     /// argument from the second on, and the last one when there is an odd
     /// number of arguments. The conditions are never returned.
     OneOfTheIifValues,
+    /// One of the first and the third argument, unchanged: `lag(x, n, default)`
+    /// and `lead(x, n, default)` return the value of x in another row, or the
+    /// default. The second argument is an offset and is never returned.
+    OneOfTheFirstAndThirdArguments,
     /// A number that keeps the type of a numeric first argument: `ceil(5)` is
     /// an integer, `ceil(5.5)` a real. A text argument is first converted to a
     /// number, so `ceil('3')` is an integer.
@@ -1934,8 +2122,11 @@ impl Func {
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
             Self::Vector(func) => declared(func.return_type()),
-            Self::External(func) => declared(func.func.return_type()),
+            Self::External(func) => func.func.result_type(),
             Self::Agg(AggFunc::Min | AggFunc::Max) => ResultType::OneOfTheArguments,
+            Self::Window(WindowFunc::Lag | WindowFunc::Lead) => {
+                ResultType::OneOfTheFirstAndThirdArguments
+            }
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             Self::Fts(_) => ResultType::Unknown,
             Self::Agg(_) | Self::Window(_) | Self::AlterTable(_) | Self::Dialect(_) => {
@@ -1961,6 +2152,34 @@ impl Func {
             self,
             Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
         )
+    }
+
+    /// [ScalarFunc::compares_or_combines_array_elements] for any function.
+    /// The other kinds of function take no array to compare or combine.
+    pub fn compares_or_combines_array_elements(&self) -> bool {
+        match self {
+            Self::Scalar(func) => func.compares_or_combines_array_elements(),
+            Self::Agg(_)
+            | Self::Window(_)
+            | Self::Math(_)
+            | Self::Vector(_)
+            | Self::AlterTable(_)
+            | Self::External(_)
+            | Self::Dialect(_) => false,
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(_) => false,
+            #[cfg(feature = "json")]
+            Self::Json(_) => false,
+        }
+    }
+
+    /// Whether the function is an aggregate, built in or from an extension.
+    pub fn is_aggregate(&self) -> bool {
+        match self {
+            Self::Agg(_) => true,
+            Self::External(f) => f.func.is_aggregate(),
+            _ => false,
+        }
     }
 
     pub fn supports_star_syntax(&self) -> bool {
@@ -2021,7 +2240,7 @@ impl Func {
         false
     }
     /// Resolve a built-in function name. Thin wrapper over
-    /// [`crate::dialect::engine::resolve_builtin_function_name`], where the
+    /// [`crate::functions::builtin::resolve_builtin_function_name`], where the
     /// SQLite name table lives; kept on `Func` for the engine call sites
     /// that classify translated AST.
     ///
@@ -2029,7 +2248,7 @@ impl Func {
     /// loading uses this, and a schema written by an older Turso that accepted
     /// such a call must still load. Translating the call rejects it.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        crate::dialect::engine::resolve_builtin_function_name(name, arg_count)
+        crate::functions::builtin::resolve_builtin_function_name(name, arg_count)
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.

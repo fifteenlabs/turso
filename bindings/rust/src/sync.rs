@@ -55,6 +55,20 @@ pub enum RemoteEncryptionCipher {
 }
 
 impl RemoteEncryptionCipher {
+    fn cipher_name(self) -> &'static str {
+        match self {
+            Self::Aes256Gcm => "aes256gcm",
+            Self::Aes128Gcm => "aes128gcm",
+            Self::ChaCha20Poly1305 => "chacha20poly1305",
+            Self::Aegis128L => "aegis128l",
+            Self::Aegis128X2 => "aegis128x2",
+            Self::Aegis128X4 => "aegis128x4",
+            Self::Aegis256 => "aegis256",
+            Self::Aegis256X2 => "aegis256x2",
+            Self::Aegis256X4 => "aegis256x4",
+        }
+    }
+
     /// Returns the total reserved bytes as required by the server
     pub fn reserved_bytes(&self) -> usize {
         match self {
@@ -106,18 +120,21 @@ pub struct Builder {
     partial_sync_config_experimental: Option<PartialSyncOpts>,
     // Encryption key (base64-encoded) for the Turso Cloud database
     remote_encryption_key: Option<String>,
+    local_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
     // Sync-protocol override: None (default) auto-detects the remote protocol
     // from the first pull-updates response; Some(true) forces MVCC logical-log
     // pulls; Some(false) forces page-stream pulls.
     logical_mvcc_pull: Option<bool>,
+    // Bootstrap chunk size in bytes; None bootstraps in one request.
+    pull_bytes_threshold: Option<usize>,
+    // Maximum number of bootstrap chunk requests in flight; None means 1.
+    pull_parallel_requests: Option<usize>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
-    // expose the same SQL surface as their local-only counterparts. Local
-    // at-rest `encryption` is intentionally omitted because the sync engine
-    // does not support local encryption (cloud encryption is configured
-    // separately via `with_remote_encryption`).
+    // expose the same SQL surface as their local-only counterparts.
+    // The sync encryption opt-in also enables core encryption.
     enable_attach: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
@@ -126,6 +143,7 @@ pub struct Builder {
     enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    enable_sync_encryption: bool,
 }
 
 impl Builder {
@@ -140,8 +158,11 @@ impl Builder {
             bootstrap_if_empty: true,
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
+            local_encryption_key: None,
             remote_encryption_cipher: None,
             logical_mvcc_pull: None,
+            pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -150,6 +171,7 @@ impl Builder {
             enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            enable_sync_encryption: false,
         }
     }
 
@@ -220,6 +242,13 @@ impl Builder {
         self
     }
 
+    /// Opt in to experimental local encryption for synced replicas.
+    /// Required when a local encryption key is configured, including offline reopen.
+    pub fn experimental_sync_encryption(mut self, enable: bool) -> Self {
+        self.enable_sync_encryption = enable;
+        self
+    }
+
     // Set remote_url for HTTP requests.
     // If remote_url omitted in configuration - tursodb will try to load it from the metadata file
     pub fn with_remote_url(mut self, remote_url: impl Into<String>) -> Self {
@@ -279,7 +308,7 @@ impl Builder {
     }
 
     /// Set encryption key (base64-encoded) and cipher for the Turso Cloud database.
-    /// The cipher is used to calculate the correct reserved_bytes for the database.
+    /// Both credentials are sent on encrypted sync requests.
     pub fn with_remote_encryption(
         mut self,
         base64_key: impl Into<String>,
@@ -290,10 +319,31 @@ impl Builder {
         self
     }
 
+    /// Configure a single cipher and independent local (hex) and cloud (base64) keys.
+    /// The cloud key may be omitted when reopening an initialized replica offline.
+    pub fn with_encryption(
+        mut self,
+        cipher: RemoteEncryptionCipher,
+        local_key: Option<String>,
+        cloud_key: Option<String>,
+    ) -> Self {
+        self.remote_encryption_cipher = Some(cipher);
+        self.local_encryption_key = local_key;
+        self.remote_encryption_key = cloud_key;
+        self
+    }
+
+    /// Encrypt local database and sync files with this hex-encoded key.
+    /// Uses the same cipher selected by `with_remote_encryption`.
+    /// Requires `experimental_sync_encryption(true)`.
+    pub fn with_local_encryption_key(mut self, hex_key: impl Into<String>) -> Self {
+        self.local_encryption_key = Some(hex_key.into());
+        self
+    }
+
     /// Set encryption key (base64-encoded) for the Turso Cloud database.
-    /// The key will be sent as x-turso-encryption-key header with sync HTTP requests.
-    /// Note: For deferred sync (no initial bootstrap), use with_remote_encryption() instead
-    /// to also specify the cipher for correct reserved_bytes calculation.
+    /// A cipher must also be configured before `build`; use `with_remote_encryption`
+    /// to set both. Key-only encrypted sync configurations are rejected.
     pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
         self.remote_encryption_key = Some(base64_key.into());
         self
@@ -310,6 +360,22 @@ impl Builder {
         self
     }
 
+    /// Split the initial bootstrap download into `/pull-updates` requests of
+    /// at least `bytes` each. By default the bootstrap is one request. Has no
+    /// effect with the query partial-sync bootstrap strategy.
+    pub fn with_pull_bytes_threshold(mut self, bytes: usize) -> Self {
+        self.pull_bytes_threshold = Some(bytes);
+        self
+    }
+
+    /// Maximum number of bootstrap chunk requests in flight at once when the
+    /// bootstrap is split with [`Builder::with_pull_bytes_threshold`].
+    /// Defaults to 1. With 0, [`Builder::build`] returns an error.
+    pub fn with_pull_parallel_requests(mut self, requests: usize) -> Self {
+        self.pull_parallel_requests = Some(requests);
+        self
+    }
+
     /// Compose the `experimental_features` comma-separated string consumed by
     /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
     /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
@@ -317,6 +383,9 @@ impl Builder {
     /// feature tokens must match the names parsed by the core.
     fn experimental_features_string(&self) -> Option<String> {
         let mut features: Vec<&str> = Vec::new();
+        if self.enable_sync_encryption {
+            features.push("sync_encryption");
+        }
         if self.enable_attach {
             features.push("attach");
         }
@@ -350,17 +419,35 @@ impl Builder {
 
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
+        if self.pull_parallel_requests == Some(0) {
+            return Err(Error::Misuse(
+                "pull_parallel_requests must be at least 1".to_string(),
+            ));
+        }
+
         // Compose the experimental_features string from the boolean flags
         // exposed on this Builder.
         let experimental_features = self.experimental_features_string();
-
+        let local_encryption = self
+            .local_encryption_key
+            .as_ref()
+            .map(|key| {
+                let cipher = self.remote_encryption_cipher.ok_or_else(|| {
+                    Error::Error("local sync encryption requires a shared cipher".into())
+                })?;
+                Ok::<_, Error>(turso_core::EncryptionOpts {
+                    cipher: cipher.cipher_name().into(),
+                    hexkey: key.clone(),
+                })
+            })
+            .transpose()?;
         // Build core database config for the embedded engine.
         let db_config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
             path: self.path.clone(),
             experimental_features,
             // IMPORTANT: async IO must be turned on to delegate IO to this layer.
             async_io: true,
-            encryption: None,
+            encryption: local_encryption,
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
@@ -381,6 +468,9 @@ impl Builder {
 
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
+            cipher: self
+                .remote_encryption_cipher
+                .map(|cipher| cipher.cipher_name().to_string()),
             path: self.path.clone(),
             remote_url: url.clone(),
             client_name: self
@@ -395,7 +485,8 @@ impl Builder {
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
-            pull_bytes_threshold: None,
+            pull_bytes_threshold: self.pull_bytes_threshold,
+            pull_parallel_requests: self.pull_parallel_requests,
             logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
@@ -805,6 +896,7 @@ impl IoWorker {
         wakers: Arc<Mutex<Vec<Waker>>>,
         client: Client<HttpsConnector<HttpConnector>, ChunkedBody>,
     ) {
+        let open_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while rx.recv().await.is_some() {
             let Some(sync) = sync.upgrade() else {
                 break;
@@ -815,7 +907,12 @@ impl IoWorker {
                 let item = sync.take_io_item();
                 let Some(item) = item else {
                     sync.step_io_callbacks();
-                    IoWorker::notify_progress(&wakers);
+                    // An open HTTP request wakes the waiting futures itself
+                    // when it has progress. Waking them here as well would
+                    // make them poll and kick this loop without pause.
+                    if open_requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        IoWorker::notify_progress(&wakers);
+                    }
                     break;
                 };
 
@@ -832,20 +929,33 @@ impl IoWorker {
                         body,
                         headers,
                     } => {
-                        IoWorker::process_http(
-                            &sync,
-                            base_url.as_deref(),
-                            auth_token.as_ref(),
-                            &wakers,
-                            &client,
-                            url.as_deref(),
-                            &method,
-                            &path,
-                            body.map(Bytes::from),
-                            &headers,
-                            completion,
-                        )
-                        .await;
+                        // Each request streams its body on its own task, so
+                        // requests the engine issues together run in parallel.
+                        let sync = sync.clone();
+                        let base_url = base_url.clone();
+                        let auth_token = auth_token.clone();
+                        let wakers = wakers.clone();
+                        let client = client.clone();
+                        let open_requests = open_requests.clone();
+                        open_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            IoWorker::process_http(
+                                &sync,
+                                base_url.as_deref(),
+                                auth_token.as_ref(),
+                                &wakers,
+                                &client,
+                                url.as_deref(),
+                                &method,
+                                &path,
+                                body.map(Bytes::from),
+                                &headers,
+                                completion,
+                            )
+                            .await;
+                            open_requests.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            IoWorker::notify_progress(&wakers);
+                        });
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
                         IoWorker::process_full_read(&path, completion, &sync).await;
@@ -1093,6 +1203,21 @@ mod tests {
 
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
+
+    #[tokio::test]
+    async fn local_encryption_requires_a_shared_cipher_before_io() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing-cipher.db");
+        let result = super::Builder::new_remote(path.to_str().unwrap())
+            .experimental_sync_encryption(true)
+            .with_local_encryption_key("16".repeat(32))
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(crate::Error::Error(message)) if message.contains("requires a shared cipher"))
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn missing_native_roots_returns_build_error() {
@@ -1347,6 +1472,19 @@ mod tests {
     #[test]
     fn experimental_features_string_composition() {
         use crate::sync::Builder;
+
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_sync_encryption(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("sync_encryption")
+        );
+        assert!(Builder::new_remote(":memory:")
+            .experimental_sync_encryption(true)
+            .experimental_sync_encryption(false)
+            .experimental_features_string()
+            .is_none());
 
         // No features enabled -> no experimental_features string at all.
         assert_eq!(
@@ -1828,6 +1966,64 @@ mod tests {
                 vec![Value::Text("sync".to_string())],
             ]
         );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_bootstrap_parallel_chunks() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server
+            .db_sql("CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT value, randomblob(1024) FROM generate_series(1, 200)")
+            .await
+            .unwrap();
+        // The token provider runs at the start of every HTTP request. It
+        // stays open for 20 ms and records how many calls were open together.
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .with_pull_bytes_threshold(8192)
+            .with_pull_parallel_requests(4)
+            .with_auth_token_fn({
+                let open = open.clone();
+                let max_open = max_open.clone();
+                move || {
+                    let open = open.clone();
+                    let max_open = max_open.clone();
+                    async move {
+                        let now = open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_open.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        open.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok("token".to_string())
+                    }
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(max_open.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let conn = db.connect().await.unwrap();
+        let rows = conn
+            .query("SELECT COUNT(*), SUM(x), SUM(length(y)) FROM t", ())
+            .await
+            .unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![vec![
+                Value::Integer(200),
+                Value::Integer(20100),
+                Value::Integer(200 * 1024)
+            ]]
+        );
+        let rows = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(all, vec![vec![Value::Text("ok".to_string())]]);
     }
 
     #[tokio::test]
@@ -2883,6 +3079,42 @@ mod tests {
         });
 
         (url, captured, notify)
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_open_request_does_not_poll_in_a_loop() {
+        // The first request stays open for 500 ms in the token provider,
+        // then fails.
+        let build = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_auth_token_fn(|| async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Err(crate::Error::Error("no token".to_string()))
+            })
+            .build();
+        let mut build = std::pin::pin!(build);
+        let mut polls = 0;
+        let result = std::future::poll_fn(|cx| {
+            polls += 1;
+            std::future::Future::poll(build.as_mut(), cx)
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(polls < 100, "build was polled {polls} times");
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_zero_pull_parallel_requests_is_an_error() {
+        let result = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_pull_parallel_requests(0)
+            .build()
+            .await;
+        let message = result.err().map(|e| e.to_string());
+        assert_eq!(
+            message.as_deref(),
+            Some("pull_parallel_requests must be at least 1")
+        );
     }
 
     fn extract_bearer_token(headers: &[String]) -> Option<String> {

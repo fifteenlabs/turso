@@ -1,8 +1,8 @@
+use crate::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
 use super::collate::{
     check_collate_operand, check_expr_collation, comparison_collation, first_collation,
@@ -98,18 +98,18 @@ pub(crate) use arrays::{
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
 pub(crate) use binding::check_custom_types;
-pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_expr_except, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
-pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
+pub use columns::{emit_stored_column, emit_table_column};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{
     check_custom_operator, custom_operator_call, emit_operator_call_on_registers,
 };
 pub(crate) use custom_types::read_untyped_operand_as;
 pub(crate) use custom_types::{
-    emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
-    emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_constraint_values_decode, emit_conversion, emit_decode, emit_dml_expr_index_value,
+    emit_encode_for_comparison, emit_store_value, emit_trigger_decode_registers,
     emit_untyped_operand_store, emit_user_facing_column_value,
 };
 pub(crate) use custom_types::{runs_custom_type_function, takes_input_of_type};

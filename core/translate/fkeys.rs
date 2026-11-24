@@ -1,11 +1,9 @@
-use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use crate::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::{
-    emit_constraint_values_decode, emit_stored_column, emit_table_column_for_dml,
-};
+use crate::translate::expr::{emit_constraint_values_decode, emit_stored_column};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
 use crate::{
@@ -350,7 +348,7 @@ fn copy_with_affinity(
 /// Build an unpacked key for opcodes that require adjacent registers; rowid aliases
 /// may resolve outside the compact column block.
 #[inline]
-fn copy_context_columns_with_affinity(
+pub(crate) fn copy_context_columns_with_affinity(
     program: &mut ProgramBuilder,
     dml_ctx: &DmlColumnContext,
     column_positions: &[usize],
@@ -561,16 +559,11 @@ where
     for (i, &pos) in child_positions.iter().enumerate() {
         let tmp = program.alloc_register();
         if let Some(ref ctx) = dml_ctx {
-            emit_table_column_for_dml(
-                program,
-                ccur,
-                ctx.clone(),
-                &child_tbl.columns()[pos],
-                pos,
-                tmp,
-                resolver,
-                child_tbl,
-            )?;
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.to_column_reg(pos),
+                dst_reg: tmp,
+                extra_amount: 0,
+            });
         } else {
             emit_stored_column(program, ccur, pos, tmp, resolver)?;
         }
@@ -669,41 +662,6 @@ pub fn emit_fk_restrict_halt(
     Ok(())
 }
 
-/// Stabilize the NEW row image for FK checks (UPDATE):
-/// fill in unmodified PK columns from the current row so the NEW PK vector is complete.
-pub fn stabilize_new_row_for_fk(
-    program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
-    set_cols: &ColumnMask,
-    cursor_id: usize,
-    start: usize,
-    rowid_new_reg: usize,
-) -> Result<()> {
-    if table_btree.primary_key_columns.is_empty() {
-        return Ok(());
-    }
-
-    let layout = table_btree.column_layout()?;
-    for (pk_name, _) in &table_btree.primary_key_columns {
-        let (pos, col) = table_btree
-            .get_column(pk_name)
-            .ok_or_else(|| LimboError::InternalError(format!("pk col {pk_name} missing")))?;
-        if !set_cols.get(pos) {
-            let dst_reg = layout.to_register(start, pos);
-            if col.is_rowid_alias() {
-                program.emit_insn(Insn::Copy {
-                    src_reg: rowid_new_reg,
-                    dst_reg,
-                    extra_amount: 0,
-                });
-            } else {
-                program.emit_column_or_rowid(cursor_id, pos, dst_reg);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Handles rowid and `INTEGER PRIMARY KEY` parent-key updates.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_rowid_pk_change_check(
@@ -787,16 +745,11 @@ pub fn emit_parent_index_key_change_checks(
         .transpose()?;
     for (i, index_col) in index.columns.iter().enumerate() {
         if let Some(ref ctx) = dml_ctx {
-            emit_table_column_for_dml(
-                program,
-                cursor_id,
-                ctx.clone(),
-                &table_btree.columns()[index_col.pos_in_table],
-                index_col.pos_in_table,
-                old_key + i,
-                resolver,
-                &Arc::new(table_btree.clone()),
-            )?;
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.to_column_reg(index_col.pos_in_table),
+                dst_reg: old_key + i,
+                extra_amount: 0,
+            });
         } else {
             emit_stored_column(
                 program,
@@ -1051,7 +1004,9 @@ fn emit_fk_parent_key_probe(
 
 /// An index on exactly the child key columns that can find the child rows of
 /// a parent key: its key columns must compare with the parent key's
-/// collations, otherwise a seek would miss or wrongly find child rows.
+/// collations, otherwise a seek would miss or wrongly find child rows. A
+/// partial index cannot find them all, because it has no entries for the
+/// child rows that fail its WHERE clause.
 pub(super) fn child_index_for_fk(
     resolver: &Resolver,
     database_id: usize,
@@ -1061,7 +1016,8 @@ pub(super) fn child_index_for_fk(
     resolver.with_schema(database_id, |s| {
         s.get_indices(fk_ref.child_namespace, &fk_ref.child_table.name)
             .find(|ix| {
-                ix.columns.len() == child_cols.len()
+                ix.where_clause.is_none()
+                    && ix.columns.len() == child_cols.len()
                     && ix
                         .columns
                         .iter()
@@ -1109,7 +1065,7 @@ fn build_parent_key(
         .transpose()?;
 
     for (i, pcol) in parent_cols.iter().enumerate() {
-        let Some((pos, col)) = parent_bt.get_column(pcol) else {
+        let Some((pos, _)) = parent_bt.get_column(pcol) else {
             if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
                 // child column references parent rowid
                 program.emit_insn(Insn::Copy {
@@ -1122,19 +1078,12 @@ fn build_parent_key(
             return Err(LimboError::InternalError(format!("col {pcol} missing")));
         };
 
-        if some_fk_cols_are_virtual {
-            // the virtual column will need the registers we previously copied
-            emit_table_column_for_dml(
-                program,
-                parent_cursor_id,
-                ctx.clone()
-                    .expect("ctx is always computed if some fk cols are virtual"),
-                col,
-                pos,
-                dest_start + i,
-                resolver,
-                &Arc::new(parent_bt.clone()),
-            )?;
+        if let Some(ref ctx) = ctx {
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.to_column_reg(pos),
+                dst_reg: dest_start + i,
+                extra_amount: 0,
+            });
         } else {
             emit_stored_column(program, parent_cursor_id, pos, dest_start + i, resolver)?;
         }
@@ -1913,20 +1862,25 @@ fn emit_fk_action_subprogram(
         );
         Subprogram::Pending(slot)
     } else {
+        let Some(depth) = program.nested_subprogram_depth() else {
+            return Ok(());
+        };
         let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
+            depth,
         );
         subprogram_builder
             .flags
             .set_writes_stored_values(ctx.new_key_is_stored);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
-        // Foreign-key actions see every row, as in PostgreSQL, so a cascading
-        // delete also removes the rows that row-level security hides.
-        resolver.without_row_security(|resolver| {
+        // Foreign-key actions see every row and need no privileges, as in
+        // PostgreSQL, so a cascading delete also removes the rows that
+        // row-level security hides from the role whose delete started it.
+        resolver.as_superuser(|resolver| {
             translate_inner(
                 stmt,
                 resolver,
@@ -1936,7 +1890,7 @@ fn emit_fk_action_subprogram(
             )
         })?;
         subprogram_builder.epilogue(resolver.schema());
-        let built = subprogram_builder.build(connection.clone(), true, description)?;
+        let built = subprogram_builder.build(connection, true, description)?;
         let prepared = built.prepared().clone();
         entry
             .slot
@@ -1991,6 +1945,7 @@ fn generate_cascade_delete_stmt(
             ctx,
         ))),
         returning: vec![],
+        truncate: false,
     }
 }
 
@@ -2494,7 +2449,8 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 
 /// Fire FK actions for UPDATE on parent table using Program opcode.
 /// This is called after the UPDATE is performed but before AFTER triggers.
-/// `old_values_start` is the register where OLD column values are stored (loaded before Delete+Insert).
+/// `old_values_start` is the register where OLD column values are stored (loaded before Delete+Insert),
+/// in the order that `old_image_layout` gives.
 #[allow(clippy::too_many_arguments)]
 pub fn fire_fk_update_actions(
     program: &mut ProgramBuilder,
@@ -2502,6 +2458,7 @@ pub fn fire_fk_update_actions(
     parent_table_name: &str,
     old_rowid_reg: usize,
     old_values_start: usize,
+    old_image_layout: &ColumnLayout,
     new_values_start: usize,
     new_rowid_reg: usize,
     connection: &Arc<Connection>,
@@ -2515,11 +2472,7 @@ pub fn fire_fk_update_actions(
         })
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
-    // OLD-image registers are allocated one-per-schema-column in declaration order; the NEW image
-    // lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
-    let old_image_layout = ColumnLayout::Identity {
-        column_count: parent_bt.columns().len(),
-    };
+    // The NEW image lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
     let new_image_layout = ColumnLayout::from_btree(&parent_bt)?;
 
     for fk_ref in affected_parent_fks {
@@ -2537,7 +2490,7 @@ pub fn fire_fk_update_actions(
             &parent_bt,
             parent_cols,
             old_values_start,
-            &old_image_layout,
+            old_image_layout,
             old_rowid_reg,
             old_key_start,
         )?;

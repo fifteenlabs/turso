@@ -21,6 +21,7 @@ pub(crate) mod expr;
 pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
+pub(crate) mod foreign_key_check;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
@@ -52,6 +53,8 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+use crate::alloc::{DynBox, StatementAllocationSite, TursoBoxExt};
+use crate::ast;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -71,7 +74,6 @@ use schema::{translate_create_table, translate_create_virtual_table, translate_d
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_parser::ast;
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -99,13 +101,15 @@ pub fn translate(
     } else {
         connection.get_capture_data_changes_info().clone()
     };
-    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
-    let mut program = Box::new(ProgramBuilder::new(
-        query_mode,
-        capture_data_changes_info,
-        // These options will be extended whithin each translate program
-        ProgramBuilderOpts::new(1, 32, 2),
-    ));
+    let mut program =
+        new_program_builder(&connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new(
+                query_mode,
+                capture_data_changes_info,
+                // These options will be extended whithin each translate program
+                ProgramBuilderOpts::new(1, 32, 2),
+            )
+        })?;
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.flags.set_reads_stored_values(matches!(
         origin,
@@ -151,13 +155,14 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
+            connection.dialect().get_internal_dialect()
         } else {
             connection.dialect()
         },
         search_path.as_deref(),
         row_security_role,
     );
+    resolver.automatic_index = connection.automatic_index();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
@@ -171,9 +176,9 @@ pub fn translate(
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
     if check_privileges
         && !resolver
-            .schema()
-            .roles
-            .is_superuser(connection.current_role())
+            .catalog
+            .dialect
+            .role_is_superuser(resolver.schema(), connection.current_role())
     {
         resolver.role_is_not_superuser = true;
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
@@ -196,7 +201,43 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(connection, change_cnt_on, input)
+    build_program(program, &connection, change_cnt_on, input)
+}
+
+/// Makes a program builder with `new`, in memory from the statement allocator
+/// of the database. The allocation is at `site`. Rust makes the builder on the
+/// stack and then copies it into the box. This function is not inlined, so
+/// that the builder is in the stack frame of this function, and not in the
+/// frame of its caller.
+#[inline(never)]
+pub(crate) fn new_program_builder(
+    connection: &Connection,
+    site: StatementAllocationSite,
+    new: impl FnOnce() -> ProgramBuilder,
+) -> Result<DynBox<ProgramBuilder>> {
+    let builder = new();
+    let alloc = connection.db.allocators.statement.clone();
+    #[cfg(feature = "allocation_metric")]
+    let _site_guard = crate::alloc::enter_allocation_site(site);
+    #[cfg(not(feature = "allocation_metric"))]
+    let _ = site;
+    Ok(DynBox::try_new_in(builder, alloc)?)
+}
+
+/// Builds the program of a builder in memory from the statement allocator.
+/// [ProgramBuilder::build] takes the builder as a value, so the builder leaves
+/// its box here. This function is not inlined, so that the builder is in the
+/// stack frame of this function, and not in the frame of its caller. The
+/// compilation of nested triggers recurses one time for each level, so the
+/// builder must not be in the frame of the code that recurses.
+#[inline(never)]
+pub(crate) fn build_program(
+    builder: DynBox<ProgramBuilder>,
+    connection: &Arc<Connection>,
+    change_cnt_on: bool,
+    input: &str,
+) -> Result<Program> {
+    TursoBoxExt::into_inner(builder).build(connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -243,6 +284,7 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::DropRole { .. }
             | ast::Stmt::Grant(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
@@ -259,6 +301,8 @@ fn translate_statement(
             | ast::Stmt::AlterSequenceOwnedBy { .. }
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
+            | ast::Stmt::CreatePolicy(_)
+            | ast::Stmt::DropPolicy { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -292,6 +336,15 @@ fn translate_statement(
     } else {
         None
     };
+
+    let mut stmt = stmt;
+    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
+        && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
+    if resolver.catalog.dialect.binds_names_at_create() {
+        if let ast::Stmt::CreateView { select, .. } = &mut stmt {
+            view::bind_table_names(select, resolver);
+        }
+    }
 
     match stmt {
         ast::Stmt::AlterTable(alter) => {
@@ -333,6 +386,7 @@ fn translate_statement(
             program,
             connection,
             input,
+            bound_sequence_names,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
@@ -397,6 +451,7 @@ fn translate_statement(
             returning,
             indexed,
             with,
+            truncate,
         } => {
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
@@ -410,6 +465,7 @@ fn translate_statement(
                 returning,
                 indexed,
                 with,
+                truncate,
                 program,
                 connection,
             )?
@@ -428,13 +484,22 @@ fn translate_statement(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(
+            resolver,
+            &trigger_name,
+            if_exists,
+            connection,
+            program,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
-        ast::Stmt::CreateRole { role_name } => {
-            roles::translate_create_role(&role_name, resolver, program)?
+        ast::Stmt::CreateRole { role_name, options } => {
+            roles::translate_create_role(role_name, options, resolver, program, connection)?
+        }
+        ast::Stmt::DropRole { if_exists, roles } => {
+            roles::translate_drop_role(if_exists, roles, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
@@ -445,7 +510,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(
+                &type_name,
+                &body,
+                if_not_exists,
+                resolver,
+                connection,
+                program,
+            )?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -466,6 +538,7 @@ fn translate_statement(
                 default,
                 if_not_exists,
                 resolver,
+                connection,
                 program,
             )?
         }
@@ -476,7 +549,9 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(
+                &type_name, if_exists, false, resolver, connection, program,
+            )?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -485,7 +560,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(
+                &domain_name,
+                if_exists,
+                true,
+                resolver,
+                connection,
+                program,
+            )?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
@@ -531,6 +613,7 @@ fn translate_statement(
             columns,
             body,
             returning,
+            overriding_system_value,
         } => translate_insert(
             resolver,
             or_conflict,
@@ -539,6 +622,7 @@ fn translate_statement(
             body,
             returning,
             with,
+            overriding_system_value,
             program,
             connection,
         )?,
@@ -584,6 +668,23 @@ fn translate_statement(
         }
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;
+        }
+        ast::Stmt::CreatePolicy(policy) => {
+            row_security::translate_create_policy(&policy, resolver, program, connection)?;
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => {
+            row_security::translate_drop_policy(
+                &policy_name,
+                &tbl_name,
+                if_exists,
+                resolver,
+                program,
+                connection,
+            )?;
         }
     };
 
@@ -652,6 +753,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::DropRole { .. } => "drop_role",
         ast::Stmt::Grant(_) => "grant",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
@@ -676,6 +778,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::AlterSequenceOwnedBy { .. } => "alter_sequence_owned_by",
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
+        ast::Stmt::CreatePolicy(_) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 
@@ -683,13 +787,16 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 mod tests {
     use super::*;
     use crate::alloc::TryClone;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::io::MemoryIO;
     use crate::namespace::NamespaceId;
-    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
-    use crate::vdbe::insn::{ClearBtreeCount, Insn};
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type,
+        SQLITE_SEQUENCE_TABLE_NAME,
+    };
+    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::EngineDialect;
 
     #[test]
     fn view_expansion_restores_context_after_errors() {
@@ -736,21 +843,36 @@ mod tests {
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
     fn test_regexp_no_function_registered() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let (db, conn) = open_database();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
-        let cmd = parser.next().unwrap().unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
+        // SELECT 'x' REGEXP 'y'
+        let regexp = ast::Expr::Like {
+            lhs: Box::new(text("x")),
+            not: false,
+            op: ast::LikeOperator::Regexp,
+            rhs: Box::new(text("y")),
+            escape: None,
         };
-
+        let stmt = ast::Stmt::Select(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(regexp), None)],
+                    from: None,
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        });
         let result = translate(
             &schema,
             stmt,
@@ -769,193 +891,32 @@ mod tests {
     }
 
     #[test]
-    fn nth_value_reads_from_saved_rows_without_an_accumulator() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE items(value)").unwrap();
-
-        let statement = conn
-            .prepare("SELECT nth_value(value, 2) OVER (ORDER BY value) FROM items")
-            .unwrap();
-        let instructions = &statement.get_program().insns;
-
-        let missing_row_target = instructions
-            .iter()
-            .find_map(|(instruction, _)| match instruction {
-                Insn::SeekRowid { target_pc, .. } => Some(target_pc.as_offset_int() as usize),
-                _ => None,
-            })
-            .expect("nth_value must read its answer from the saved window rows");
-        assert!(
-            matches!(
-                &instructions[missing_row_target].0,
-                Insn::Halt { on_error: None, .. }
-            ),
-            "a missing saved row must stop execution instead of returning NULL"
-        );
-        assert!(
-            instructions.iter().all(|(instruction, _)| !matches!(
-                instruction,
-                Insn::AggStep { .. } | Insn::AggValue { .. }
-            )),
-            "nth_value must not keep another copy of saved values in an accumulator"
-        );
-    }
-
-    #[test]
-    fn delete_without_where_clears_table_and_index_btrees() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
-            .unwrap();
-        conn.execute("CREATE UNIQUE INDEX items_name ON items(name)")
-            .unwrap();
-        conn.execute("CREATE INDEX items_score ON items(score) WHERE score > 0")
-            .unwrap();
-        conn.execute("INSERT INTO items VALUES(1, 'one', -1), (2, 'two', 0), (3, 'three', 1)")
-            .unwrap();
-
-        let mut statement = conn.prepare("DELETE FROM items").unwrap();
-        let instructions = &statement.get_program().insns;
-        let clears = instructions
-            .iter()
-            .filter_map(|(instruction, _)| match instruction {
-                Insn::ClearBtree { count, .. } => Some(*count),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            clears,
-            vec![
-                ClearBtreeCount::RowsWritten,
-                ClearBtreeCount::RowsWritten,
-                ClearBtreeCount::ChangesAndRowsWritten,
-            ],
-            "both indexes and then the table must be cleared, and only the table counts changes"
-        );
-        assert!(
-            instructions
-                .iter()
-                .all(|(instruction, _)| !matches!(instruction, Insn::Delete { .. })),
-            "a whole-table delete must not emit the row-at-a-time Delete opcode"
-        );
-
-        statement.run_ignore_rows().unwrap();
-        assert_eq!(statement.n_change(), 3);
-        assert_eq!(
-            statement.metrics().rows_written,
-            7,
-            "metrics must count table, full-index, and partial-index entries"
-        );
-
-        statement.reset().unwrap();
-        statement.reset_metrics();
-        statement.run_ignore_rows().unwrap();
-        assert_eq!(statement.n_change(), 0);
-        assert_eq!(statement.metrics().rows_written, 0);
-
-        statement.reset().unwrap();
-        statement.reset_metrics();
-        conn.execute("INSERT INTO items VALUES(4, 'four', -1), (5, 'five', 1)")
-            .unwrap();
-        statement.run_ignore_rows().unwrap();
-        assert_eq!(statement.n_change(), 2);
-        assert_eq!(
-            statement.metrics().rows_written,
-            5,
-            "reused statements must recount table and index entries"
-        );
-
-        statement.reset().unwrap();
-        statement.reset_metrics();
-        conn.execute(
-            "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 3000) \
-             INSERT INTO items SELECT x, printf('name-%0200d', x), x % 2 FROM c",
-        )
-        .unwrap();
-        statement.run_ignore_rows().unwrap();
-        assert_eq!(statement.n_change(), 3000);
-        assert_eq!(
-            statement.metrics().rows_written,
-            3000 + 3000 + 1500,
-            "interior cells of the index B-trees are entries, interior cells of the table are not"
-        );
-    }
-
-    #[test]
-    fn delete_keeps_row_loop_when_rows_need_individual_processing() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
-            .unwrap();
-
-        for sql in [
-            "DELETE FROM items WHERE 1",
-            "DELETE FROM items RETURNING id",
-        ] {
-            let statement = conn.prepare(sql).unwrap();
-            assert!(
-                statement
-                    .get_program()
-                    .insns
-                    .iter()
-                    .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
-                "{sql} must process rows individually"
-            );
-        }
-
-        conn.execute("CREATE TABLE deleted_items(id)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER log_item_delete AFTER DELETE ON items \
-             BEGIN INSERT INTO deleted_items VALUES(old.id); END",
-        )
-        .unwrap();
-        let statement = conn.prepare("DELETE FROM items").unwrap();
-        assert!(
-            statement
-                .get_program()
-                .insns
-                .iter()
-                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
-            "DELETE triggers require the row loop"
-        );
-
-        conn.execute("PRAGMA foreign_keys = ON").unwrap();
-        conn.execute("CREATE TABLE parents(id INTEGER PRIMARY KEY)")
-            .unwrap();
-        conn.execute("CREATE TABLE children(parent_id REFERENCES parents(id))")
-            .unwrap();
-        let statement = conn.prepare("DELETE FROM parents").unwrap();
-        assert!(
-            statement
-                .get_program()
-                .insns
-                .iter()
-                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
-            "foreign-key actions require the row loop"
-        );
-    }
-
-    #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-            .unwrap();
-
+        let (db, conn) = open_database();
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        let seq_root_page = schema
-            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
-            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
-            .root_page;
-        let malformed_seq =
-            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
-                .expect("malformed sqlite_sequence SQL should parse");
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(autoincrement_table_t()))
+            .unwrap();
+        // CREATE TABLE sqlite_sequence(name)
+        let malformed_seq = BTreeTable::new(
+            3,
+            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            crate::alloc::vec![],
+            crate::alloc::vec![Column::new(
+                Some("name".to_string()),
+                String::new(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            )],
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        );
         schema.insert_table(
             NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -965,16 +926,9 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
-        let cmd = parser.next().unwrap().unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
         let err = translate(
             &schema,
-            stmt,
+            insert_into_t(),
             pager,
             conn,
             &syms,
@@ -996,28 +950,21 @@ mod tests {
 
     #[test]
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-            .unwrap();
-
+        let (db, conn) = open_database();
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
+        schema
+            .add_btree_table(NamespaceId::ROOT, Arc::new(autoincrement_table_t()))
+            .unwrap();
+        assert!(schema
+            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+            .is_none());
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
-        let cmd = parser.next().unwrap().unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
         let err = translate(
             &schema,
-            stmt,
+            insert_into_t(),
             pager,
             conn,
             &syms,
@@ -1037,32 +984,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
+    fn open_database() -> (Arc<Database>, Arc<crate::Connection>) {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        conn.execute("CREATE TABLE ref(x);").unwrap();
-        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
-        conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT * FROM ref; END;")
+        let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.execute("DROP TABLE ref;").unwrap();
+        (db, conn)
+    }
 
-        let err = conn
-            .execute("INSERT INTO t VALUES (1);")
-            .expect_err("single-row insert should fail while trigger references dropped table");
-        assert!(
-            err.to_string().contains("no such table: ref"),
-            "expected missing-table error, got: {err}"
+    /// `CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`
+    fn autoincrement_table_t() -> BTreeTable {
+        let id = Column::new(
+            Some("id".to_string()),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            None,
+            ColDef {
+                flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias,
+                ..Default::default()
+            },
         );
+        let v = Column::new_default_text(Some("v".to_string()), "TEXT".to_string(), None);
+        BTreeTable::new(
+            2,
+            "t".to_string(),
+            crate::alloc::vec![("id".to_string(), ast::SortOrder::Asc)],
+            crate::alloc::vec![id, v],
+            BTreeCharacteristics::HAS_ROWID | BTreeCharacteristics::HAS_AUTOINCREMENT,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        )
+    }
 
-        let err = conn.execute("INSERT INTO t VALUES (2), (3);").expect_err(
-            "multi-row insert should still fail instead of skipping the poisoned trigger",
-        );
-        assert!(
-            err.to_string().contains("no such table: ref"),
-            "expected missing-table error, got: {err}"
-        );
+    /// `INSERT INTO t(v) VALUES('x')`
+    fn insert_into_t() -> ast::Stmt {
+        ast::Stmt::Insert {
+            with: None,
+            or_conflict: None,
+            tbl_name: ast::QualifiedName::single(ast::Name::exact("t".to_string())),
+            columns: vec![ast::Name::exact("v".to_string())],
+            body: ast::InsertBody::Select(
+                ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: ast::OneSelect::Values(vec![vec![Box::new(text("x"))]]),
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                },
+                None,
+            ),
+            returning: vec![],
+            overriding_system_value: false,
+        }
+    }
+
+    fn text(value: &str) -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::String(format!("'{value}'")))
     }
 }

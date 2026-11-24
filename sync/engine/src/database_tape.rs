@@ -16,6 +16,7 @@ use crate::{
     wal_session::WalSession,
     Result,
 };
+use turso_core::SessionRole;
 
 /// Simple wrapper over `turso::Database` which extends its intereface with few methods
 /// to collect changes made to the database and apply/revert arbitrary changes to the database
@@ -25,6 +26,7 @@ pub struct DatabaseTape {
     pragma_query: String,
     cdc_version: std::sync::RwLock<Option<turso_core::CdcVersion>>,
     disable_auto_checkpoint: bool,
+    encryption_key: Option<turso_core::EncryptionKey>,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
@@ -161,17 +163,22 @@ impl DatabaseTape {
             pragma_query,
             cdc_version: std::sync::RwLock::new(None),
             disable_auto_checkpoint: opts.disable_auto_checkpoint,
+            encryption_key: None,
         }
     }
+    pub fn with_encryption_key(mut self, key: Option<turso_core::EncryptionKey>) -> Self {
+        self.encryption_key = key;
+        self
+    }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
@@ -232,7 +239,7 @@ impl DatabaseTape {
         opts: DatabaseChangesIteratorOpts,
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
-        let conn = self.inner.connect(ConnectOpts::new())?;
+        let conn = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
@@ -257,6 +264,10 @@ impl DatabaseTape {
             max_change_id_exclusive: opts.max_change_id_exclusive,
         })
     }
+    fn connect_options(&self) -> ConnectOpts {
+        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(self.encryption_key.clone())
+    }
+
     /// Start raw WAL edit session which can append or rollback pages directly in the current WAL
     pub async fn start_wal_session<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DatabaseWalSession> {
         let conn = self.connect(coro).await?;
@@ -955,7 +966,7 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use turso_core::ConnectOpts;
+    use turso_core::{ConnectOpts, SessionRole};
     use turso_sqlite::SqliteDialect;
 
     use tempfile::NamedTempFile;
@@ -1690,7 +1701,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect(ConnectOpts::new())
+        db1.connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -1778,7 +1789,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect(ConnectOpts::new())
+        db1.connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();

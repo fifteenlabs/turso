@@ -43,7 +43,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{DatabaseOpts, OpenFlags, Value};
+use turso_core::{OpenFlags, SessionRole, Value};
 use turso_pg::{Connection, Error, Statement};
 use turso_pg_server::TursoPgServer;
 
@@ -106,13 +106,7 @@ fn open_database(
     Arc<turso_core::Database>,
     Connection,
 )> {
-    let db_opts = DatabaseOpts::new()
-        .with_views(true)
-        .with_custom_types(true)
-        .with_encryption(true)
-        .with_index_method(true)
-        .with_autovacuum(true)
-        .with_attach(true);
+    let db_opts = turso_pg::tursopg_database_opts();
     let db_opts = if enable_load_extension {
         db_opts.turso_cli()
     } else {
@@ -684,6 +678,9 @@ fn write_pg_error(w: &mut dyn Write, error: &Error) {
     if let Some(detail) = &error.detail {
         let _ = writeln!(w, "DETAIL:  {detail}");
     }
+    if let Some(hint) = &error.hint {
+        let _ = writeln!(w, "HINT:  {hint}");
+    }
 }
 
 fn print_result_set(
@@ -1016,7 +1013,7 @@ fn main() -> anyhow::Result<()> {
             address.clone(),
             db_file,
             db,
-            turso_core::ConnectOpts::new(),
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
             interrupt_count,
         );
         return server.run();

@@ -19,7 +19,7 @@ use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
-use turso_parser::ast::ColumnConstraint;
+use turso_core::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -28,12 +28,19 @@ use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
+use crate::runner::swarm;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
+use turso_core::SessionRole;
+use turso_core::storage::sqlite3_ondisk::PageSize;
 
 /// Pre-create attached DB files with MVCC journal mode so that journal modes
 /// are compatible when ATTACH happens later during simulation.
-fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Item = PathBuf>) {
+fn enable_mvcc_on_attached_dbs(
+    io: &Arc<dyn SimIO>,
+    aux_paths: impl Iterator<Item = PathBuf>,
+    page_size: usize,
+) {
     for aux_path in aux_paths {
         let aux_db = Database::open_file_with_flags(
             io.clone(),
@@ -45,8 +52,11 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
-            .connect(ConnectOpts::new())
+            .connect(ConnectOpts::new(SessionRole::Superuser))
             .expect("Failed to connect to aux DB for MVCC setup");
+        aux_conn
+            .execute(format!("PRAGMA page_size = {page_size}"))
+            .expect("Failed to set the page size of aux DB before enabling MVCC");
         aux_conn
             .execute("PRAGMA journal_mode = 'mvcc'")
             .expect("Failed to enable MVCC on aux DB");
@@ -1174,7 +1184,7 @@ mod tests {
     /// and one row per (a, b) pair, with g materialized in the shadow rows.
     fn table_with_unique_generated_column(rows: &[(i64, i64)]) -> Table {
         use sql_generation::model::table::{Column, ColumnType};
-        use turso_parser::ast;
+        use turso_core::ast;
 
         let generated_expr = ast::Expr::Binary(
             Box::new(ast::Expr::Id(ast::Name::from_string("a"))),
@@ -1568,6 +1578,93 @@ mod tests {
         );
         assert_eq!(sequence_state(&commited_sequences), in_transaction);
     }
+
+    #[test]
+    fn page_size_option_reaches_main_and_attached_databases() {
+        use clap::Parser;
+        let args = SimulatorCLI::parse_from(["limbo_sim", "--io-backend", "memory"]);
+        let setups = [
+            (SimulationType::Default, false),
+            (SimulationType::Default, true),
+            (SimulationType::Differential, false),
+        ];
+        for (simulation_type, mvcc) in setups {
+            for size in [512, 65536] {
+                let output = tempfile::tempdir().unwrap();
+                let profile = Profile {
+                    mvcc,
+                    ..Profile::faultless()
+                };
+                let mut env = SimulatorEnv::new(
+                    1,
+                    &args,
+                    Paths::new(output.path()),
+                    simulation_type,
+                    &profile,
+                );
+                env.opts.page_size = size;
+                assert_eq!(
+                    page_sizes_after_first_write(&mut env),
+                    (size, size),
+                    "{simulation_type:?}, mvcc={mvcc}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_size_comes_from_the_seed_or_the_flag() {
+        use clap::Parser;
+        let page_size = |seed: u64, args: &[&str]| {
+            let output = tempfile::tempdir().unwrap();
+            let env = SimulatorEnv::new(
+                seed,
+                &SimulatorCLI::parse_from(args),
+                Paths::new(output.path()),
+                SimulationType::Default,
+                &Profile::faultless(),
+            );
+            env.opts.page_size
+        };
+        let drawn: std::collections::BTreeSet<usize> = (1..=20)
+            .map(|seed| page_size(seed, &["limbo_sim", "--io-backend", "memory"]))
+            .collect();
+        assert!(
+            drawn.len() > 1,
+            "every seed drew the same page size: {drawn:?}"
+        );
+        let flag = ["limbo_sim", "--io-backend", "memory", "--page-size", "512"];
+        assert!((1..=20).all(|seed| page_size(seed, &flag) == 512));
+    }
+
+    /// Page sizes that main and aux0 report once each has a table.
+    fn page_sizes_after_first_write(env: &mut SimulatorEnv) -> (usize, usize) {
+        env.clear();
+        env.connect(0);
+        match &env.connections[0] {
+            SimConnection::LimboConnection(conn) => {
+                conn.execute("CREATE TABLE t1(a)").unwrap();
+                conn.execute("CREATE TABLE aux0.t1(a)").unwrap();
+                let read = |sql: &str| {
+                    let size = conn.prepare(sql).unwrap().run_collect_rows().unwrap()[0][0]
+                        .as_int()
+                        .unwrap();
+                    usize::try_from(size).unwrap()
+                };
+                (read("PRAGMA main.page_size"), read("PRAGMA aux0.page_size"))
+            }
+            SimConnection::SQLiteConnection(conn) => {
+                conn.execute_batch("CREATE TABLE t1(a); CREATE TABLE aux0.t1(a);")
+                    .unwrap();
+                let read = |sql: &str| {
+                    conn.query_row(sql, [], |row| row.get::<_, usize>(0))
+                        .unwrap()
+                };
+                (read("PRAGMA main.page_size"), read("PRAGMA aux0.page_size"))
+            }
+            SimConnection::Disconnected => unreachable!("connect(0) opens connection 0"),
+        }
+    }
 }
 
 /// Shadow model for a sequence. Like the engine, which stores each sequence in a
@@ -1723,8 +1820,10 @@ impl SimulatorEnv {
         // Re-enable MVCC mode if the profile says to use MVCC
         if self.profile.mvcc {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(SessionRole::Superuser))
                 .expect("Failed to create connection for MVCC setup");
+            conn.execute(format!("PRAGMA page_size = {}", self.opts.page_size))
+                .expect("Failed to set the page size before enabling MVCC");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
 
@@ -1733,6 +1832,7 @@ impl SimulatorEnv {
                 self.attached_dbs
                     .iter()
                     .map(|name| self.get_aux_db_path(name)),
+                self.opts.page_size,
             );
         }
 
@@ -1814,6 +1914,17 @@ impl SimulatorEnv {
 
         let num_attached = rng.random_range(1..=3usize);
         let attached_dbs: Vec<String> = (0..num_attached).map(|i| format!("aux{i}")).collect();
+        let max_interactions = rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests);
+        // Drawing the page size before the other settings would change the number of
+        // attached databases and the plan length of every seed.
+        let drawn_page_size =
+            1usize << rng.random_range(PageSize::MIN.ilog2()..=PageSize::MAX.ilog2());
+        let page_size = cli_opts.page_size.map_or(drawn_page_size, |size| {
+            PageSize::new(size)
+                .unwrap_or_else(|| panic!("--page-size {size} is not a valid page size"))
+                .get() as usize
+        });
+        tracing::info!("page_size={page_size}");
 
         let mut opts = SimulatorOpts {
             seed,
@@ -1831,8 +1942,8 @@ impl SimulatorEnv {
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
-            page_size: 4096, // TODO: randomize this too
-            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
+            page_size,
+            max_interactions,
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
             disable_integrity_check: cli_opts.disable_integrity_check,
@@ -1912,12 +2023,15 @@ impl SimulatorEnv {
             // SQLite does not have LATERAL joins, so we can't use this property.
             opts.disable_lateral_matches_json_each = true;
         }
+        let mut io_backend = cli_opts.io_backend.unwrap_or_default();
+        if cli_opts.swarm {
+            swarm::apply(seed, cli_opts, &mut profile, &mut opts, &mut io_backend);
+        }
 
         profile.validate().unwrap();
 
         let latency_prof = &profile.io.latency;
 
-        let io_backend = cli_opts.io_backend;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,
@@ -1958,8 +2072,10 @@ impl SimulatorEnv {
         // Switch to MVCC mode if the profile says to use MVCC
         if profile.mvcc {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(SessionRole::Superuser))
                 .expect("Failed to create connection for MVCC setup");
+            conn.execute(format!("PRAGMA page_size = {}", opts.page_size))
+                .expect("Failed to set the page size before enabling MVCC");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
 
@@ -1968,6 +2084,7 @@ impl SimulatorEnv {
                 attached_dbs
                     .iter()
                     .map(|name| paths.aux_db(&simulation_type, &SimulationPhase::Test, name)),
+                opts.page_size,
             );
         }
 
@@ -2011,7 +2128,7 @@ impl SimulatorEnv {
                     .db
                     .as_ref()
                     .expect("db to be Some")
-                    .connect(ConnectOpts::new())
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
                     .expect("Failed to connect to Limbo database");
                 if self.opts.cache_size != DEFAULT_CACHE_SIZE {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
@@ -2027,7 +2144,11 @@ impl SimulatorEnv {
             }
         };
 
+        self.set_page_size(connection_index, "main");
         self.attach_databases(connection_index);
+        for name in &self.attached_dbs {
+            self.set_page_size(connection_index, name);
+        }
     }
 
     fn attach_databases(&self, connection_index: usize) {
@@ -2043,6 +2164,26 @@ impl SimulatorEnv {
                         .unwrap_or_else(|e| panic!("Failed to ATTACH {name} on SQLite: {e}"));
                 }
                 SimConnection::Disconnected => {}
+            }
+        }
+    }
+
+    /// Sets the page size of `database`, which takes effect only while it has no pages.
+    fn set_page_size(&self, connection_index: usize, database: &str) {
+        let pragma = format!("PRAGMA {database}.page_size = {}", self.opts.page_size);
+        match &self.connections[connection_index] {
+            SimConnection::LimboConnection(conn) => {
+                conn.execute(&pragma)
+                    .unwrap_or_else(|e| panic!("{pragma} failed: {e}"));
+            }
+            SimConnection::SQLiteConnection(conn) => {
+                conn.execute_batch(&pragma)
+                    .unwrap_or_else(|e| panic!("{pragma} failed on SQLite: {e}"));
+            }
+            SimConnection::Disconnected => {
+                unreachable!(
+                    "connect() opens connection {connection_index} before setting its page size"
+                )
             }
         }
     }

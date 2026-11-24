@@ -26,12 +26,14 @@
 //! writes made before it remain part of the handle's transaction and commit at
 //! close, exactly as `sqlite3_blob_write` documents.
 
+use crate::ast::Privilege;
 use crate::namespace::NamespaceId;
 use crate::translate::collate::CollationSeq;
+use crate::translate::{build_program, new_program_builder};
 use std::num::NonZero;
 use std::sync::Arc;
 
-use crate::alloc::TursoSliceExt;
+use crate::alloc::{StatementAllocationSite, TursoSliceExt};
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::storage::pager::Pager;
@@ -353,7 +355,7 @@ impl Connection {
         let root = table_ref.root_page;
         let program = build_blob_program(self, table_ref, root, record_column, rowid, read_write)?;
         let pager = self.get_pager();
-        let mut stmt = Statement::new(program, pager.clone(), QueryMode::Normal, 0);
+        let mut stmt = Statement::new(program, self.clone(), pager.clone(), QueryMode::Normal, 0)?;
         // Excluded from the explicit-checkpoint guard's active-statement
         // count: the handle parks at its row for its whole lifetime, and an
         // open blob handle must not block checkpointing until it is closed.
@@ -401,7 +403,7 @@ fn check_blob_privileges(
     read_write: bool,
 ) -> Result<()> {
     let role = conn.current_role();
-    if schema.roles.is_superuser(role) {
+    if conn.dialect().role_is_superuser(schema, role) {
         return Ok(());
     }
     let denied = |action| {
@@ -415,7 +417,7 @@ fn check_blob_privileges(
     }
     if conn
         .dialect()
-        .role_may_read(schema, NamespaceId::ROOT, table, role)
+        .role_has_privilege(schema, NamespaceId::ROOT, table, role, Privilege::Select)
     {
         return Ok(());
     }
@@ -436,7 +438,9 @@ fn build_blob_program(
     rowid: i64,
     read_write: bool,
 ) -> Result<crate::vdbe::Program> {
-    let mut b = ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 64, 16));
+    let mut b = new_program_builder(conn, StatementAllocationSite::ProgramBuilder, || {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 64, 16))
+    })?;
     b.prologue();
     if read_write {
         b.begin_write_operation()
@@ -563,6 +567,6 @@ fn build_blob_program(
     b.preassign_label_to_next_insn(l_end);
 
     conn.with_schema_mut(|schema| b.epilogue(schema))?;
-    b.build(conn.clone(), false, "incremental blob io")
+    build_program(b, conn, false, "incremental blob io")
         .map_err(|e| LimboError::InternalError(format!("blob program build failed: {e}")))
 }
